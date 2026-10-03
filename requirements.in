@@ -1,0 +1,7 @@
+fastapi==0.115.12
+sgp4==2.26
+numpy==2.2.6
+uvicorn==0.34.2
+python-multipart==0.0.20
+httpx==0.28.1
+pytest==8.3.5
