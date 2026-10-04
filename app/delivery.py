@@ -90,3 +90,42 @@ def build_iq_zip(meta: dict, corrected: bytes, diagnostics: dict) -> bytes:
         zf.writestr("diagnostics.json",
                     json.dumps(diagnostics, ensure_ascii=False, indent=2))
     return buf.getvalue()
+
+
+OBSERVATIONS_HEADER = [
+    "window_index",
+    "time_utc",
+    "peak_freq_hz",
+    "peak_power",
+    "median_power",
+    "accepted",
+]
+
+RESIDUALS_HEADER = [
+    "time_utc",
+    "observed_hz",
+    "predicted_hz",
+    "residual_hz",
+]
+
+
+def render_table(header: list[str], rows) -> str:
+    out = io.StringIO()
+    w = csv.writer(out, lineterminator="\n")
+    w.writerow(header)
+    w.writerows(rows)
+    return out.getvalue()
+
+
+def build_beacon_zip(summary: dict, observations_csv: str,
+                     residual_csvs: dict[str, str]) -> bytes:
+    """ZIP with the identification summary, per-window observations and
+    per-candidate residual CSVs."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("summary.json",
+                    json.dumps(summary, ensure_ascii=False, indent=2))
+        zf.writestr("observations.csv", observations_csv)
+        for name, content in sorted(residual_csvs.items()):
+            zf.writestr(f"residuals/{name}", content)
+    return buf.getvalue()

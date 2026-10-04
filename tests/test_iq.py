@@ -83,8 +83,10 @@ def test_correct_happy_path():
     assert sorted(zf.namelist()) == [
         "corrected.sigmf-data", "corrected.sigmf-meta", "diagnostics.json"]
     out_meta = json.loads(zf.read("corrected.sigmf-meta"))
-    # centre frequency moved to the transmit frequency, UTC unchanged
-    assert out_meta["global"]["core:frequency"] == TX_HZ
+    # capture-level centre frequency moved to the transmit frequency,
+    # the stale global value is dropped, UTC unchanged
+    assert out_meta["captures"][0]["core:frequency"] == TX_HZ
+    assert "core:frequency" not in out_meta["global"]
     assert out_meta["captures"][0]["core:datetime"] == \
         meta["captures"][0]["core:datetime"]
     assert out_meta["global"]["core:sample_rate"] == FS

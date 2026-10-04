@@ -9,8 +9,12 @@ import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import Response
 
-from .delivery import (build_iq_zip, build_zip, interval_csv_rows,
-                       interval_to_dict, render_csv)
+from .beacon import (MIN_SPAN_S, accepted_span_s, decide,
+                     evaluate_candidate, measure_windows)
+from .delivery import (OBSERVATIONS_HEADER, RESIDUALS_HEADER,
+                       build_beacon_zip, build_iq_zip, build_zip,
+                       interval_csv_rows, interval_to_dict, render_csv,
+                       render_table)
 from .doppler import WINDOW_LEN, correct, shift_node_times, shift_nodes
 from .doppler import window_diagnostics
 from .passes import HorizonMask, PropagationError, Site, find_passes
@@ -295,7 +299,8 @@ async def doppler_correct(forecast: str = Form(...),
     windows = window_diagnostics(samples, corrected, info.sample_rate_hz)
 
     out_meta = copy.deepcopy(info.meta)
-    out_meta["global"]["core:frequency"] = tx_hz
+    out_meta["captures"][0]["core:frequency"] = tx_hz
+    out_meta["global"].pop("core:frequency", None)
     diagnostics = {
         "satellite_id": satellite_id,
         "station_id": station_id,
@@ -317,3 +322,164 @@ async def doppler_correct(forecast: str = Form(...),
         content=payload, media_type="application/zip",
         headers={"Content-Disposition":
                  'attachment; filename="doppler_corrected.zip"'})
+
+
+BEACON_NOTES = [
+    "A single stable unmodulated carrier is assumed; identity tags "
+    "(annotations) are not read.",
+    "Measurements use non-overlapping 1024-point Hann windows with "
+    "3-point parabolic peak refinement across the FFT wrap boundary; "
+    "windows whose peak power does not exceed 10x the median spectral "
+    "power are dropped, and the accepted windows must span at least 5 s.",
+    "Predicted baseband shift = (f_tx - f_center) - f_tx * range_rate / c "
+    "at each accepted window centre; each candidate's downlink frequency "
+    "is its transmit frequency.",
+    "The constant LO offset is estimated as mean(observed - predicted); "
+    "the de-biased residual RMS scores each candidate.",
+    "Candidates are excluded when the recording is not fully inside one "
+    "of their visibility intervals, when the prediction reaches the "
+    "Nyquist bound, or when the estimated bias exceeds the limit.",
+    "Status: 'no-match' when no candidate is comparable or the best RMS "
+    "exceeds the RMS limit; 'ambiguous' when the two best RMS values "
+    "differ by no more than the separation; otherwise 'identified'. "
+    "Ties are shown ordered by satellite id; no unique identification "
+    "is claimed unless the status is 'identified'.",
+]
+
+
+def _parse_positive_finite(raw: str, name: str) -> float:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=422,
+                            detail=f"{name} must be a number") from exc
+    if not (value > 0.0) or value != value or value in (float("inf"), float("-inf")):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{name} must be a positive finite number (Hz)")
+    return value
+
+
+async def _beacon_common(forecast: str, station_id: str,
+                         bias_limit_hz: str, rms_limit_hz: str,
+                         separation_hz: str,
+                         meta: UploadFile, data: UploadFile):
+    bias_limit = _parse_positive_finite(bias_limit_hz, "bias_limit_hz")
+    rms_limit = _parse_positive_finite(rms_limit_hz, "rms_limit_hz")
+    separation = _parse_positive_finite(separation_hz, "separation_hz")
+    try:
+        req = ForecastRequest.model_validate(json.loads(forecast))
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise HTTPException(status_code=422,
+                            detail=f"invalid forecast request: {exc}") from exc
+    stn_in = next((s for s in req.stations if s.id == station_id), None)
+    if stn_in is None:
+        raise HTTPException(status_code=422,
+                            detail=f"unknown station id {station_id!r}")
+
+    meta_raw = await meta.read(MAX_META_BYTES + 1)
+    data_raw = await data.read(MAX_DATA_BYTES + 1)
+    try:
+        info = sigmf_validate(meta_raw, len(data_raw))
+    except SigmfError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    samples = np.frombuffer(data_raw, dtype="<c8").copy()
+    if not (np.isfinite(samples.real).all()
+            and np.isfinite(samples.imag).all()):
+        raise HTTPException(status_code=422,
+                            detail="recording contains non-finite samples")
+
+    t0 = info.start_time
+    t1 = t0 + timedelta(seconds=info.duration_s)
+    rows = measure_windows(samples, info.sample_rate_hz, t0)
+    kept = [r for r in rows if r.accepted]
+    span = accepted_span_s(rows)
+    if span < MIN_SPAN_S:
+        raise HTTPException(
+            status_code=422,
+            detail=f"accepted windows span {span:.3f} s "
+                   f"({len(kept)} of {len(rows)} windows kept), less than "
+                   f"the required {MIN_SPAN_S:.0f} s")
+
+    site = Site(station_id=stn_in.id, lat_deg=stn_in.lat_deg,
+                lon_deg=stn_in.lon_deg, alt_m=stn_in.alt_m,
+                mask=HorizonMask(stn_in.mask))
+    outcomes = []
+    try:
+        for sat_in in req.satellites:
+            outcomes.append(evaluate_candidate(
+                sat_in, site, t0, t1, kept, info.sample_rate_hz,
+                info.center_frequency_hz))
+    except PropagationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    status, ranking = decide(outcomes, bias_limit, rms_limit, separation)
+
+    best = next((r for r in ranking if r["rank"] == 1), None)
+    summary = {
+        "status": status,
+        "identified_satellite_id":
+            best["satellite_id"] if status == "identified" else None,
+        "station_id": station_id,
+        "recording": {
+            "start_time_utc": t0.isoformat().replace("+00:00", "Z"),
+            "duration_s": info.duration_s,
+            "sample_rate_hz": info.sample_rate_hz,
+            "center_frequency_hz": info.center_frequency_hz,
+            "sample_count": info.sample_count,
+        },
+        "thresholds": {"bias_limit_hz": bias_limit,
+                       "rms_limit_hz": rms_limit,
+                       "separation_hz": separation},
+        "windows": {"length": 1024, "shape": "hann", "overlap": 0,
+                    "total": len(rows), "accepted": len(kept),
+                    "accepted_span_s": round(span, 9)},
+        "ranking": ranking,
+        "notes": BEACON_NOTES,
+    }
+    obs_csv = render_table(
+        OBSERVATIONS_HEADER,
+        [[r.index, r.time_utc.isoformat().replace("+00:00", "Z"),
+          f"{r.freq_hz:.3f}", f"{r.peak_power:.6e}",
+          f"{r.median_power:.6e}", int(r.accepted)] for r in rows])
+    residual_csvs = {}
+    for o in outcomes:
+        if o.status == "comparable":
+            residual_csvs[f"{o.satellite_id}.csv"] = render_table(
+                RESIDUALS_HEADER,
+                [[row["time_utc"], f"{row['observed_hz']:.3f}",
+                  f"{row['predicted_hz']:.3f}", f"{row['residual_hz']:.3f}"]
+                 for row in o.rows])
+    return summary, obs_csv, residual_csvs
+
+
+@app.post("/api/beacon/identify")
+async def beacon_identify(forecast: str = Form(...),
+                          station_id: str = Form(...),
+                          bias_limit_hz: str = Form(...),
+                          rms_limit_hz: str = Form(...),
+                          separation_hz: str = Form(...),
+                          meta: UploadFile = File(...),
+                          data: UploadFile = File(...)):
+    summary, _obs_csv, _residual_csvs = await _beacon_common(
+        forecast, station_id, bias_limit_hz, rms_limit_hz, separation_hz,
+        meta, data)
+    return summary
+
+
+@app.post("/api/beacon/identify/download")
+async def beacon_identify_download(forecast: str = Form(...),
+                                   station_id: str = Form(...),
+                                   bias_limit_hz: str = Form(...),
+                                   rms_limit_hz: str = Form(...),
+                                   separation_hz: str = Form(...),
+                                   meta: UploadFile = File(...),
+                                   data: UploadFile = File(...)):
+    summary, obs_csv, residual_csvs = await _beacon_common(
+        forecast, station_id, bias_limit_hz, rms_limit_hz, separation_hz,
+        meta, data)
+    payload = build_beacon_zip(summary, obs_csv, residual_csvs)
+    return Response(
+        content=payload, media_type="application/zip",
+        headers={"Content-Disposition":
+                 'attachment; filename="beacon_identification.zip"'})

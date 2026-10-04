@@ -146,10 +146,13 @@ multipart/form-data 提交：
 
 录波约束（任一不满足即整份拒绝，HTTP 422；传播失败 400）：
 
-- 仅单通道 `cf32_le`；恰好一个 `core:sample_start = 0` 的 capture，无头尾附加字节
-  （数据文件长度必须恰好为样本数 × 8 字节）；
+- 仅单通道 `cf32_le`（`core:num_channels` 缺省或显式为 1，多通道拒绝）；
+  恰好一个 `core:sample_start = 0` 的 capture，无头尾附加字节
+  （`core:header_bytes`/`core:trailing_bytes` 缺省或为 0，
+  数据文件长度必须恰好为样本数 × 8 字节）；
 - 元数据须含 UTC 开录时间（`core:datetime`，带时区）、中心频率
-  （`core:frequency`，正有限）与采样率（`core:sample_rate`，1 kHz ~ 200 kHz）；
+  （优先取 capture 的 `core:frequency`，缺省回退 global 的
+  `core:frequency`，正有限）与采样率（`core:sample_rate`，1 kHz ~ 200 kHz）；
 - 拒绝空录波、截断（长度非 8 的倍数）、非有限样本与非法元数据；
   最多 2^20 复样本、时长 ≤ 60 s；
 - 录波全段 `[t0, t0 + N/fs]` 须落在所选站星的同一可见区间内
@@ -168,7 +171,7 @@ multipart/form-data 提交：
 响应为 ZIP（`doppler_corrected.zip`）：
 
 - `corrected.sigmf-meta`：原元数据副本，仅 `core:frequency` 改为发射频率，
-  UTC 开录时间不变；上传的原件不修改；
+  写在 capture 级（global 中的旧值被移除），UTC 开录时间不变；上传的原件不修改；
 - `corrected.sigmf-data`：校正后的 cf32_le 样本；
 - `diagnostics.json`：频移节点表 + 逐窗诊断。诊断为不重叠 1024 点 Hann 窗，
   每窗给出校正前后峰频（Hz，带符号）与均方功率（线性，|x|² 均值）；
@@ -196,3 +199,89 @@ curl -X POST localhost:8000/api/doppler/correct \
 相位积分用梯形近似，节点间频移线性插值；几何与轨道近似同预报部分
 （UTC≈UT1、GMST 旋转、不计光行时与折射）。诊断峰频分辨率为 fs/1024，
 未做抛物线插值。
+## 未知窄带信标识别
+
+在录波校正之上增加信标识别（`app/beacon.py` 测频/评分/判定、
+`app/main.py` 端点、`app/delivery.py` 打包），复用同一套 SigMF 校验、
+SGP4 传播与站点几何。**仅处理单个稳定未调制载波**，不读取任何身份标签
+（annotations 被忽略）。
+
+### POST /api/beacon/identify 与 /api/beacon/identify/download
+
+multipart/form-data 提交：
+
+- `forecast`：原 /api/passes 请求体 JSON 字符串（最多 4 颗候选卫星，
+  各自的 `downlink_frequency_hz` 即其发射频率）；
+- `station_id`：站点 ID；
+- `bias_limit_hz` / `rms_limit_hz` / `separation_hz`：正有限的
+  偏差上限、RMS 上限与分离量（Hz）；
+- `meta` / `data`：SigMF 元数据与样本文件（约束同录波校正，
+  中心频率取 capture 的 `core:frequency`，回退 global）。
+
+测量与评分：
+
+- 不重叠 1024 点 Hann 窗测频，谱峰做三点抛物线细化并处理 FFT 环边界；
+  峰功率不超过该窗谱功率中位数 10 倍的窗被剔除；有效窗中心跨度
+  不足 5 s 整份拒绝（HTTP 422）；每窗保留 UTC 时间戳；
+- 在每个有效窗中心预测基带频移
+  `shift(t) = (f_tx - f_center) - f_tx · range_rate(t) / c`；
+  录波不全落在同一可见区间、或预测达到奈奎斯特界（fs/2）的候选被排除
+  并给出原因；
+- 恒定本振偏差 = mean(观测 − 预测)，去偏残差 RMS 作为候选得分；
+  |偏差| 超限的候选同样被排除并说明。
+
+判定：无可比较候选或最低 RMS 超过 RMS 上限为 `no-match`；
+次低与最低 RMS 之差不大于分离量为 `ambiguous`（不冒称唯一识别）；
+其余为 `identified`。同分按卫星 ID 排序展示。
+
+`/api/beacon/identify` 返回 JSON：`status`、`identified_satellite_id`
+（仅 identified 时非空）、录波与窗口摘要、阈值及逐候选排名
+（排名、状态、bias_hz、rms_hz、排除原因）。
+
+`/api/beacon/identify/download` 返回 ZIP（`beacon_identification.zip`）：
+
+- `summary.json`：与 JSON 端点一致的摘要；
+- `observations.csv`：逐窗 `window_index, time_utc, peak_freq_hz,
+  peak_power, median_power, accepted`；
+- `residuals/<卫星>.csv`：每个可比较候选的逐窗
+  `time_utc, observed_hz, predicted_hz, residual_hz`。
+
+### 可复现示例
+
+```bash
+# 生成含未知载波的示例录波（确定性合成：ISS 预报多普勒 + 180 Hz 恒定本振偏差）
+.venv/bin/python examples/make_beacon_recording.py
+
+# 识别：候选为 ISS 与 RAAN 扰动 5° 的 ISS-DRIFT（examples/beacon_request.json）
+curl -X POST localhost:8000/api/beacon/identify \
+  -F 'forecast=<examples/beacon_request.json' \
+  -F station_id=BEIJING \
+  -F bias_limit_hz=500 -F rms_limit_hz=50 -F separation_hz=2 \
+  -F meta=@examples/iq/beacon.sigmf-meta \
+  -F data=@examples/iq/beacon.sigmf-data
+# -> status "identified", identified_satellite_id "ISS"（RMS ≈ 0.3 Hz vs ≈ 9 Hz）
+
+# 下载 ZIP（summary.json + observations.csv + residuals/*.csv）
+curl -X POST localhost:8000/api/beacon/identify/download \
+  -F 'forecast=<examples/beacon_request.json' \
+  -F station_id=BEIJING \
+  -F bias_limit_hz=500 -F rms_limit_hz=50 -F separation_hz=2 \
+  -F meta=@examples/iq/beacon.sigmf-meta \
+  -F data=@examples/iq/beacon.sigmf-data \
+  -o beacon_identification.zip
+
+# 歧义示例：SAT-A/SAT-B 同一轨道、下行频率相差 30 Hz，
+# 差值被恒定本振偏差吸收，残差 RMS 相同
+curl -X POST localhost:8000/api/beacon/identify \
+  -F 'forecast=<examples/beacon_ambiguous_request.json' \
+  -F station_id=BEIJING \
+  -F bias_limit_hz=500 -F rms_limit_hz=50 -F separation_hz=2 \
+  -F meta=@examples/iq/beacon.sigmf-meta \
+  -F data=@examples/iq/beacon.sigmf-data
+# -> status "ambiguous"，不给出唯一识别
+```
+
+范围与近似：仅单载波、未调制、频率在录波内近似跟随轨道多普勒加恒定偏差；
+测频分辨率为 fs/1024 再经抛物线细化（Hann 主瓣拟合误差约 1% bin 量级）；
+几何与轨道近似同预报部分（UTC≈UT1、GMST 旋转、不计光行时与折射）。
+调制或多载波信号不在本功能范围内。

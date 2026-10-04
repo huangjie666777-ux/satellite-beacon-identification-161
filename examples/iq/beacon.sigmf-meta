@@ -1,0 +1,16 @@
+{
+  "global": {
+    "core:datatype": "cf32_le",
+    "core:sample_rate": 48000.0,
+    "core:version": "1.0.0",
+    "core:description": "synthetic unmodulated beacon carrier (ISS/BEIJING)"
+  },
+  "captures": [
+    {
+      "core:sample_start": 0,
+      "core:datetime": "2024-01-01T02:29:43Z",
+      "core:frequency": 145798500.0
+    }
+  ],
+  "annotations": []
+}

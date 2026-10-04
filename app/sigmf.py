@@ -2,6 +2,9 @@
 
 Only the strict subset needed here is accepted: one capture segment
 starting at sample 0, no header/trailing bytes, datatype cf32_le.
+The centre frequency is read from the capture's core:frequency, falling
+back to the global core:frequency. Multi-channel recordings and
+non-zero header/trailing byte counts are rejected.
 """
 from __future__ import annotations
 
@@ -37,6 +40,22 @@ class RecordingInfo:
 def _finite_number(value) -> bool:
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value))
+
+
+def _reject_unsupported(container: dict, where: str) -> None:
+    num_ch = container.get("core:num_channels", 1)
+    if (not isinstance(num_ch, int) or isinstance(num_ch, bool)
+            or num_ch != 1):
+        raise SigmfError(
+            f"{where} core:num_channels must be 1, got {num_ch!r}: "
+            "multi-channel recordings are not supported")
+    for key in ("core:header_bytes", "core:trailing_bytes"):
+        extra = container.get(key, 0)
+        if (not isinstance(extra, int) or isinstance(extra, bool)
+                or extra != 0):
+            raise SigmfError(
+                f"{where} {key} must be 0 or absent, got {extra!r}: "
+                "additional header/trailing bytes are not supported")
 
 
 def parse_start_time(value) -> datetime:
@@ -75,6 +94,8 @@ def validate(meta_raw: bytes, data_len: int) -> RecordingInfo:
         raise SigmfError(
             f"core:datatype must be {DATATYPE!r}, got {datatype!r}")
 
+    _reject_unsupported(glob, "global")
+
     sample_rate = glob.get("core:sample_rate")
     if not _finite_number(sample_rate):
         raise SigmfError("global core:sample_rate must be a finite number")
@@ -83,17 +104,13 @@ def validate(meta_raw: bytes, data_len: int) -> RecordingInfo:
             f"core:sample_rate {sample_rate} Hz outside "
             f"[{MIN_SAMPLE_RATE_HZ}, {MAX_SAMPLE_RATE_HZ}] Hz")
 
-    center = glob.get("core:frequency")
-    if not _finite_number(center) or center <= 0.0:
-        raise SigmfError("global core:frequency must be a positive finite "
-                         "number (Hz)")
-
     captures = meta.get("captures")
     if not isinstance(captures, list) or len(captures) != 1:
         raise SigmfError("exactly one capture segment is required")
     cap = captures[0]
     if not isinstance(cap, dict):
         raise SigmfError("captures[0] must be an object")
+    _reject_unsupported(cap, "captures[0]")
     sample_start = cap.get("core:sample_start")
     if (not isinstance(sample_start, int) or isinstance(sample_start, bool)
             or sample_start != 0):
@@ -101,6 +118,17 @@ def validate(meta_raw: bytes, data_len: int) -> RecordingInfo:
     if "core:datetime" not in cap:
         raise SigmfError("captures[0] must carry core:datetime (UTC start)")
     start_time = parse_start_time(cap["core:datetime"])
+
+    # capture-level frequency wins; fall back to the global value
+    if "core:frequency" in cap:
+        center = cap["core:frequency"]
+        where = "captures[0]"
+    else:
+        center = glob.get("core:frequency")
+        where = "global"
+    if not _finite_number(center) or center <= 0.0:
+        raise SigmfError(f"{where} core:frequency must be a positive finite "
+                         "number (Hz)")
 
     annotations = meta.get("annotations", [])
     if not isinstance(annotations, list):
