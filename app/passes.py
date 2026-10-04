@@ -94,15 +94,17 @@ def _margin(satrec, site: Site, dt: datetime) -> float:
 
 
 def _bisect_crossing(satrec, site, t_before, t_after) -> datetime:
-    """t_before has margin <= 0, t_after > 0 (or vice versa); find crossing."""
+    """t_before/t_after straddle a sign change of the margin (either
+    direction); refine the crossing and return the visible-side estimate."""
     lo, hi = t_before, t_after
+    lo_visible = _margin(satrec, site, lo) > 0.0
     while (hi - lo).total_seconds() > BISECT_TOL_S:
         mid = lo + (hi - lo) / 2
-        if _margin(satrec, site, mid) > 0.0:
-            hi = mid
-        else:
+        if (_margin(satrec, site, mid) > 0.0) == lo_visible:
             lo = mid
-    return hi
+        else:
+            hi = mid
+    return lo if lo_visible else hi
 
 
 @dataclass
@@ -123,8 +125,13 @@ def find_passes(satrec, site: Site, start: datetime, end: datetime
     Tangential touches (margin == 0 without sign change) never form an
     interval. Intervals shorter than the 1 s grid may be missed.
     """
-    n = int((end - start).total_seconds())
+    # 1 s grid that also covers the fractional tail of the window
+    span = (end - start).total_seconds()
+    n = int(span)
     times = [start + timedelta(seconds=i) for i in range(n + 1)]
+    if times[-1] < end:
+        times.append(end)
+        n += 1
     margins = [_margin(satrec, site, t) for t in times]
     visible = [m > 0.0 for m in margins]
 

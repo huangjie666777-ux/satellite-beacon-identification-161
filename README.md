@@ -70,3 +70,59 @@
 典型精度：位置百米~公里级（随 TLE 龄期增长），方向角约 0.1° 量级，
 适用于接收计划编排，不适用于精密定轨。
 
+## 双轴转台跟踪规划与回放
+
+在原预报之上增加机械规划（`app/tracker.py`）、rotctld 协议客户端
+（`app/rotctl.py`）、独占回放控制器（`app/playback.py`）与本机
+转台模拟器（`app/rotctld_sim.py`），跨文件复用同一套传播与站点几何。
+
+### POST /api/track/plan
+
+请求体（见 `examples/track_request.json`，为跨北区间示例）：
+
+- `forecast`：原 /api/passes 请求体；`interval_index`：按其返回顺序的区间编号；
+- `az_min_deg`/`az_max_deg`：机械方位限位，跨度 ≤ 720°；
+- `el_min_deg`/`el_max_deg`：仰角限位，须在 [0, 90]° 内；
+- `max_az_rate_dps`/`max_el_rate_dps`：两轴最大角速度（°/s，正有限数）；
+- `current_position`/`home_position`：当前与归位位置（须在限位内）；
+- `preset_seconds`/`homing_seconds`：预置与归位秒数（正有限数）。
+
+行为：
+
+- 目标按 1 秒采样并包含区间两端点，`t_rel_s` 为相对首个跟踪点的秒数；
+- 方位允许 +360·k 展开（不做过顶翻转），单段时长不得超过 30 分钟；
+- 完整路径 当前→预置→跟踪→归位 的每段都须满足限位与速度约束；
+  选取总方位转动最小者，同值取机械方位序列字典序最小者；
+- 任一点不可行即整段拒绝（HTTP 422），不截角、不跳点。
+
+### POST /api/playback · GET /api/playback · POST /api/playback/cancel
+
+提交体：`{"plan": <上一步响应>, "host": "127.0.0.1", "port": 4533,
+"position_tolerance_deg": 2.0, "response_timeout_s": 5.0}`。
+控制器独占运行（重复提交返回 409），按单调时钟的相对时间向本机
+rotctld TCP 端点逐点下发；启动时先用 `p` 核对实际位置。协议为换行
+分帧：`P <az> <el>` 设位、`p` 读位、`S` 停止，非零 `RPRT` 视为错误。
+超时、断连或取消会停止后续指令、尽力发 `S` 并释放占用，查询接口保留
+真实终态（`completed`/`failed`/`cancelled` 及进度、最后位置）。
+
+### 本机联调演示
+
+\`\`\`bash
+# 终端 1：转台模拟器（5°/s 恒速 slew，初始位置 0,0）
+.venv/bin/python -m app.rotctld_sim --port 4533
+# 终端 2：预报服务
+.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+# 终端 3
+curl -X POST localhost:8000/api/track/plan -d @examples/track_request.json \
+     -H 'Content-Type: application/json' > plan.json
+# 把模拟器先移到计划起点（示例为 0,5），再提交回放
+printf 'P 0.000 5.000\n' | nc 127.0.0.1 4533
+curl -X POST localhost:8000/api/playback -H 'Content-Type: application/json' \
+     -d "{\"plan\": $(cat plan.json), \"port\": 4533}"
+curl localhost:8000/api/playback          # 查询状态
+curl -X POST localhost:8000/api/playback/cancel   # 取消
+\`\`\`
+
+单位：角度为度（机械方位可超出 [0,360)），角速度为度/秒，时间为秒；
+预置/归位段按 1 秒线性斜坡下发。回放仅按相对时间发设位指令，
+不闭环校正转台实际跟踪误差。
