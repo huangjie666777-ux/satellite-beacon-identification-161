@@ -83,8 +83,18 @@ def validate(meta_raw: bytes, data_len: int) -> RecordingInfo:
             f"core:sample_rate {sample_rate} Hz outside "
             f"[{MIN_SAMPLE_RATE_HZ}, {MAX_SAMPLE_RATE_HZ}] Hz")
 
+    num_channels = glob.get("core:num_channels")
+    if num_channels is not None and num_channels != 1:
+        raise SigmfError(
+            f"multi-channel recordings are not supported "
+            f"(core:num_channels={num_channels!r})")
+    for key in ("core:offset", "core:header_bytes", "core:trailing_bytes"):
+        extra = glob.get(key)
+        if extra is not None and extra != 0:
+            raise SigmfError(f"global {key} must be 0 or absent, got {extra!r}")
+
     center = glob.get("core:frequency")
-    if not _finite_number(center) or center <= 0.0:
+    if center is not None and (not _finite_number(center) or center <= 0.0):
         raise SigmfError("global core:frequency must be a positive finite "
                          "number (Hz)")
 
@@ -101,6 +111,23 @@ def validate(meta_raw: bytes, data_len: int) -> RecordingInfo:
     if "core:datetime" not in cap:
         raise SigmfError("captures[0] must carry core:datetime (UTC start)")
     start_time = parse_start_time(cap["core:datetime"])
+    for key in ("core:offset", "core:header_bytes", "core:trailing_bytes"):
+        extra = cap.get(key)
+        if extra is not None and extra != 0:
+            raise SigmfError(
+                f"captures[0] {key} must be 0 or absent, got {extra!r}")
+
+    # the capture-level core:frequency takes precedence; fall back to the
+    # global value for older recordings
+    cap_freq = cap.get("core:frequency")
+    if cap_freq is not None:
+        if not _finite_number(cap_freq) or cap_freq <= 0.0:
+            raise SigmfError("captures[0] core:frequency must be a positive "
+                             "finite number (Hz)")
+        center = float(cap_freq)
+    if center is None:
+        raise SigmfError("a positive finite core:frequency (Hz) is required "
+                         "in captures[0] or global")
 
     annotations = meta.get("annotations", [])
     if not isinstance(annotations, list):

@@ -79,6 +79,14 @@ def render_csv(rows) -> str:
     return out.getvalue()
 
 
+def render_table(header: list[str], rows) -> str:
+    out = io.StringIO()
+    w = csv.writer(out, lineterminator="\n")
+    w.writerow(header)
+    w.writerows(rows)
+    return out.getvalue()
+
+
 
 def build_iq_zip(meta: dict, corrected: bytes, diagnostics: dict) -> bytes:
     """ZIP with corrected SigMF meta/data and per-window diagnostics."""
@@ -89,4 +97,18 @@ def build_iq_zip(meta: dict, corrected: bytes, diagnostics: dict) -> bytes:
         zf.writestr("corrected.sigmf-data", corrected)
         zf.writestr("diagnostics.json",
                     json.dumps(diagnostics, ensure_ascii=False, indent=2))
+    return buf.getvalue()
+
+
+def build_beacon_zip(summary: dict, observations_csv: str,
+                     candidate_csvs: dict[str, str]) -> bytes:
+    """ZIP with the identification summary, window observations and one
+    residual CSV per comparable candidate."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("summary.json",
+                    json.dumps(summary, ensure_ascii=False, indent=2))
+        zf.writestr("observations.csv", observations_csv)
+        for name, content in sorted(candidate_csvs.items()):
+            zf.writestr(f"candidates/{name}", content)
     return buf.getvalue()

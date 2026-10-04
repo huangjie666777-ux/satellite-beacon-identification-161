@@ -196,3 +196,91 @@ curl -X POST localhost:8000/api/doppler/correct \
 相位积分用梯形近似，节点间频移线性插值；几何与轨道近似同预报部分
 （UTC≈UT1、GMST 旋转、不计光行时与折射）。诊断峰频分辨率为 fs/1024，
 未做抛物线插值。
+
+### SigMF 频率与通道约定
+
+- 读写中心频率一律使用 capture 的 `core:frequency`；capture 缺省时
+  回退到 global 的 `core:frequency`（两者均无则拒绝）。校正输出同时
+  写入 capture 与 global。
+- 拒绝多通道录波（`core:num_channels` 非 1）与任何非零附加字节
+  （global/capture 的 `core:offset`、`core:header_bytes`、
+  `core:trailing_bytes`）；数据文件长度必须恰好为样本数 × 8 字节。
+
+## 未知窄带信标识别
+
+在原预报之上增加未知载波识别（`app/beacon.py` 测量与判定、
+`app/delivery.py` 打包、`app/main.py` 端点），复用同一套 SGP4 传播、
+站点几何与录波校验。仅处理**单个稳定未调制载波**；不读取 SigMF
+annotations 中的身份标签，识别完全基于频率轨迹匹配。
+
+### POST /api/beacon/identify · POST /api/beacon/identify/download
+
+multipart/form-data 提交：
+
+- `forecast`：原 /api/passes 请求体 JSON 字符串（最多 4 颗候选卫星，
+  各自 `downlink_frequency_hz` 即其发射频率）；
+- `station_id`：站点 ID；
+- `lo_offset_limit_hz` / `rms_limit_hz` / `separation_hz`：
+  正有限数，单位 Hz（本振偏差上限、残差 RMS 上限、分离量）；
+- `meta` / `data`：SigMF 元数据与样本文件（约束同录波校正部分）。
+
+处理流程：
+
+1. 测频：不重叠 1024 点 Hann 窗，谱峰用对数幅度三点抛物线细化
+   （跨 FFT 环边界取模）；峰功率不超过该窗谱功率中位数 10 倍的窗剔除；
+   有效窗 UTC 中心时刻逐窗保留，跨度不足 5 秒整份拒绝（422）。
+2. 逐候选在窗中心预测基带频移
+   `shift(t) = (f_tx - f_center) - f_tx·range_rate(t)/c`；
+   全段不在同一可见区间、预测达到奈奎斯特界（fs/2）、TLE 过期或
+   估计本振偏差超限的候选排除并给出原因。
+3. 本振偏差 = mean(观测 − 预测)，去偏残差 RMS 排名。
+4. 判定：无可比较候选或最低 RMS 超限为 `no-match`；次低与最低之差
+   不大于分离量为 `ambiguous`（同分候选按 ID 列出，不冒称唯一识别）；
+   其余为 `identified`。
+
+JSON 端点返回状态、排名（含排除原因、本振偏差、残差 RMS）与窗口摘要；
+download 端点返回 ZIP（`beacon_identification.zip`）：
+
+- `summary.json`：与 JSON 端点一致的摘要；
+- `observations.csv`：逐窗 `index,time_utc,measured_freq_hz,peak_power,median_power,accepted`；
+- `candidates/<卫星ID>.csv`：每个可比较候选的逐窗
+  `time_utc,observed_hz,predicted_hz,offset_hz,residual_hz`。
+
+### 可复现识别与歧义示例
+
+```bash
+# 生成 12 s 确定性录波：载波跟随 ISS 预报多普勒 + 250 Hz 固定本振偏移；
+# 元数据使用 capture 级 core:frequency
+.venv/bin/python examples/make_beacon_recording.py
+
+# 歧义：候选 ISS_ALT 与 ISS 同 TLE、下行高 300 Hz，残差差 < 0.5 Hz 分离量
+curl -X POST localhost:8000/api/beacon/identify \
+  -F 'forecast=<examples/beacon_request.json' \
+  -F station_id=BEIJING -F lo_offset_limit_hz=500 \
+  -F rms_limit_hz=1.0 -F separation_hz=0.5 \
+  -F meta=@examples/iq/beacon.sigmf-meta \
+  -F data=@examples/iq/beacon.sigmf-data
+# -> {"status":"ambiguous","ambiguous_ids":["ISS","ISS_ALT"],...}
+
+# 唯一识别：改用单候选 examples/request.json（同一录波）
+curl -X POST localhost:8000/api/beacon/identify \
+  -F 'forecast=<examples/request.json' \
+  -F station_id=BEIJING -F lo_offset_limit_hz=500 \
+  -F rms_limit_hz=1.0 -F separation_hz=0.5 \
+  -F meta=@examples/iq/beacon.sigmf-meta \
+  -F data=@examples/iq/beacon.sigmf-data
+# -> {"status":"identified","identified":"ISS",...}
+
+# 下载 ZIP（摘要 JSON + 观测 CSV + 候选残差 CSV）
+curl -X POST localhost:8000/api/beacon/identify/download \
+  -F 'forecast=<examples/beacon_request.json' \
+  -F station_id=BEIJING -F lo_offset_limit_hz=500 \
+  -F rms_limit_hz=1.0 -F separation_hz=0.5 \
+  -F meta=@examples/iq/beacon.sigmf-meta \
+  -F data=@examples/iq/beacon.sigmf-data \
+  -o beacon_identification.zip
+```
+
+范围与近似：测频偏差约 ±0.7 Hz（对数抛物线、Hann 主瓣），
+RMS 上限不宜低于约 1 Hz；同 TLE 近频候选在短录波上不可区分，
+应通过分离量参数声明为歧义而非唯一识别；几何与轨道近似同预报部分。
