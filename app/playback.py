@@ -30,6 +30,8 @@ def build_timeline(plan: dict[str, Any]) -> list[tuple[float, float, float]]:
     preset_s = float(plan["preset_seconds"])
     homing_s = float(plan["homing_seconds"])
     targets = plan["targets"]
+    if not targets:
+        raise ValueError("plan has no tracking targets")
     first = targets[0]
     last = targets[-1]
 
@@ -76,6 +78,9 @@ class PlaybackController:
 
     def submit(self, plan: dict[str, Any], host: str, port: int,
                tolerance_deg: float, timeout_s: float) -> None:
+        # build the timeline synchronously so malformed plans (e.g. no
+        # targets) are rejected before the controller is marked running
+        timeline = build_timeline(plan)
         with self._lock:
             if self._status["state"] == STATE_RUNNING:
                 raise RuntimeError("a playback is already running")
@@ -85,7 +90,7 @@ class PlaybackController:
                             "last_position": None}
         self._thread = threading.Thread(
             target=self._run,
-            args=(plan, host, port, tolerance_deg, timeout_s),
+            args=(timeline, host, port, tolerance_deg, timeout_s),
             daemon=True)
         self._thread.start()
 
@@ -96,9 +101,8 @@ class PlaybackController:
             self._cancel.set()
         return running
 
-    def _run(self, plan: dict[str, Any], host: str, port: int,
+    def _run(self, timeline: list[tuple[float, float, float]], host: str, port: int,
              tolerance_deg: float, timeout_s: float) -> None:
-        timeline = build_timeline(plan)
         self._set(progress={"sent": 0, "total": len(timeline)})
         client: RotctlClient | None = None
         final_state = STATE_COMPLETED
@@ -131,6 +135,8 @@ class PlaybackController:
             final_state, detail = STATE_CANCELLED, "cancelled by request"
         except RotctlError as exc:
             final_state, detail = STATE_FAILED, str(exc)
+        except Exception as exc:  # never leave the controller stuck running
+            final_state, detail = STATE_FAILED, f"unexpected error: {exc}"
         finally:
             if client is not None:
                 if final_state != STATE_COMPLETED:

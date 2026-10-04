@@ -104,6 +104,9 @@ rotctld TCP 端点逐点下发；启动时先用 `p` 核对实际位置。协议
 分帧：`P <az> <el>` 设位、`p` 读位、`S` 停止，非零 `RPRT` 视为错误。
 超时、断连或取消会停止后续指令、尽力发 `S` 并释放占用，查询接口保留
 真实终态（`completed`/`failed`/`cancelled` 及进度、最后位置）。
+空目标或畸形计划（`targets` 为空）在提交时即以 422 拒绝，时间线在提交前
+同步构建，回放线程内任何未预期异常都会落为 `failed` 并释放控制器，
+不会停留在 `running` 占用独占权。
 
 ### 本机联调演示
 
@@ -126,3 +129,70 @@ curl -X POST localhost:8000/api/playback/cancel   # 取消
 单位：角度为度（机械方位可超出 [0,360)），角速度为度/秒，时间为秒；
 预置/归位段按 1 秒线性斜坡下发。回放仅按相对时间发设位指令，
 不闭环校正转台实际跟踪误差。
+
+## IQ 录波多普勒校正
+
+在原预报之上增加录波校正（`app/sigmf.py` 校验、`app/doppler.py` 频移/相位/诊断、
+`app/delivery.py` 打包、`app/main.py` 端点），跨文件复用同一套 SGP4 传播与站点几何。
+
+### POST /api/doppler/correct
+
+multipart/form-data 提交：
+
+- `forecast`：原 /api/passes 请求体 JSON 字符串（含 TLE 与站点）；
+- `satellite_id` / `station_id`：所选星、站 ID；
+- `tx_frequency_hz`：正有限发射频率（Hz）；
+- `meta` / `data`：SigMF 元数据（JSON）与样本文件。
+
+录波约束（任一不满足即整份拒绝，HTTP 422；传播失败 400）：
+
+- 仅单通道 `cf32_le`；恰好一个 `core:sample_start = 0` 的 capture，无头尾附加字节
+  （数据文件长度必须恰好为样本数 × 8 字节）；
+- 元数据须含 UTC 开录时间（`core:datetime`，带时区）、中心频率
+  （`core:frequency`，正有限）与采样率（`core:sample_rate`，1 kHz ~ 200 kHz）；
+- 拒绝空录波、截断（长度非 8 的倍数）、非有限样本与非法元数据；
+  最多 2^20 复样本、时长 ≤ 60 s；
+- 录波全段 `[t0, t0 + N/fs]` 须落在所选站星的同一可见区间内
+  （用原 `find_passes` 判定）；TLE 历元距录波超过 7 天拒绝。
+
+校正模型：
+
+- 径向速度复用预报 CSV 的 ECEF 距离变化率，**远离为正**；
+- 基带频移 `shift(t) = (f_tx - f_center) - f_tx · range_rate(t) / c`，
+  即发射载波在录波基带中的位置；
+- 节点按 1 秒间隔并含录波末端计算，节点间线性插值；
+  任一节点 |shift| ≥ fs/2 即整份拒绝；
+- 相位 `phi(0) = 0`、`phi' = shift`，逐样本梯形积分（分块处理、块间相位连续），
+  样本乘 `exp(-j·phi)` 校正；**不重采样、不归一化**，样本数、采样率与幅度保持不变。
+
+响应为 ZIP（`doppler_corrected.zip`）：
+
+- `corrected.sigmf-meta`：原元数据副本，仅 `core:frequency` 改为发射频率，
+  UTC 开录时间不变；上传的原件不修改；
+- `corrected.sigmf-data`：校正后的 cf32_le 样本；
+- `diagnostics.json`：频移节点表 + 逐窗诊断。诊断为不重叠 1024 点 Hann 窗，
+  每窗给出校正前后峰频（Hz，带符号）与均方功率（线性，|x|² 均值）；
+  不足一窗则 `windows` 为空。
+
+### 可复现示例
+
+```bash
+# 生成含变频载波的示例录波（确定性合成，载波跟随预报多普勒 + 250 Hz 固定偏移）
+.venv/bin/python examples/make_iq_recording.py
+# 提交并下载
+curl -X POST localhost:8000/api/doppler/correct \
+  -F 'forecast=<examples/request.json' \
+  -F satellite_id=ISS -F station_id=BEIJING \
+  -F tx_frequency_hz=145800000.0 \
+  -F meta=@examples/iq/iss_beijing.sigmf-meta \
+  -F data=@examples/iq/iss_beijing.sigmf-data \
+  -o corrected.zip
+```
+
+校正后载波应落在 250 Hz 所在 FFT bin（48 kHz / 1024 ≈ 46.9 Hz 分辨率），
+各窗均方功率校正前后一致。
+
+单位与近似：频率 Hz、采样率 Hz、时间秒（UTC）、功率为线性均方；
+相位积分用梯形近似，节点间频移线性插值；几何与轨道近似同预报部分
+（UTC≈UT1、GMST 旋转、不计光行时与折射）。诊断峰频分辨率为 fs/1024，
+未做抛物线插值。

@@ -145,7 +145,7 @@ class TrackPlanResponse(BaseModel):
     homing_seconds: float
     current_position: Position
     home_position: Position
-    targets: list[MechTargetOut]
+    targets: list[MechTargetOut] = Field(min_length=1)
     total_az_travel_deg: float
     notes: list[str]
 

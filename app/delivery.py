@@ -78,3 +78,15 @@ def render_csv(rows) -> str:
     w.writerows(rows)
     return out.getvalue()
 
+
+
+def build_iq_zip(meta: dict, corrected: bytes, diagnostics: dict) -> bytes:
+    """ZIP with corrected SigMF meta/data and per-window diagnostics."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("corrected.sigmf-meta",
+                    json.dumps(meta, ensure_ascii=False, indent=2))
+        zf.writestr("corrected.sigmf-data", corrected)
+        zf.writestr("diagnostics.json",
+                    json.dumps(diagnostics, ensure_ascii=False, indent=2))
+    return buf.getvalue()
